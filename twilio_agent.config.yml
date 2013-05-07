@@ -1,0 +1,12 @@
+newrelic:
+  license: 'NEW_RELIC_LICENSE_KEY'
+  guid: ''
+  version: "1" # bump this everytime you upload a changed worker
+
+iron:
+  token: 'IRONIO_TOKEN'
+  project_id: 'PROJECT_ID'
+
+twilio:
+  account_sid: 'TWILIO_ACCOUNT_SID'
+  auth_token: 'TWILIO_TOKEN'
