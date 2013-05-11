@@ -1,90 +1,135 @@
 require 'yaml'
 require 'twilio-ruby'
+require 'base64'
 require 'iron_cache'
-# Requires manual installation of the New Relic plaform gem (platform is in closed beta)
+require 'active_support/core_ext'
+# Requires manual installation of the New Relic plaform gem
 # https://github.com/newrelic-platform/iron_sdk
 require 'newrelic_platform'
 
-# Setup
+# Un-comment to test/debug locally
+# config = YAML.load_file('./twilio_agent.config.yml')
 
+# Setup
 # Twilio calls statuses
-TWILIO_CALL_STATUSES = %w(queued ringing in-progress canceled completed failed busy no-answer)
+TWILIO_CALL_STATUSES =
+  %w(queued ringing in-progress canceled completed failed busy no-answer)
 TWILIO_SMS_STATUSES = %w(queued sending sent failed received)
 
 
-# configure Twilio client
+# Configure Twilio client
 @twilio = Twilio::REST::Client.new(config['twilio']['account_sid'],
                                    config['twilio']['auth_token'])
 
-# configure NewRelic client
-new_relic = NewRelic::Client.new(:license => config['newrelic']['license'],
-                                 :guid => config['newrelic']['guid'],
-                                 :version => config['newrelic']['version'])
+# Configure NewRelic client
+@new_relic = NewRelic::Client.new(:license => config['newrelic']['license'],
+                                  :guid => config['newrelic']['guid'],
+                                  :version => config['newrelic']['version'])
 
-@collector = new_relic.new_collector
-
-# configure IronCache client
+# Configure IronCache client
 ic = IronCache::Client.new(config['iron'])
 @cache = ic.cache("newrelic-twilio-agent")
 
-# helpers
+# Helpers
 
-def duration(prev, current)
-  prev ? (current - prev).to_i : 60
+def duration(from, to)
+  # do it Lisp-like (:
+  (from ? (to - from) : (to - to.beginning_of_day)).to_i
 end
 
-def add_component_data(name, metric, data, since)
-  component = @collector.component(name)
+def make_metric_record(name, unit, value)
+  [name, unit, value]
+end
 
-  data.each_pair do |key, value|
-    component.add_metric(key, metric, value)
+def daily_process_since(previously_at)
+  today = Time.now.utc.to_date
+  dates = [today]
+
+  yesterday = today.yesterday.to_time :utc
+  since = if previously_at
+            at = Time.at(prev).utc
+            # no earlier than yesterday
+            (at < yesterday) ? yesterday : at
+          else # first run
+            today.to_time :utc
+          end
+
+  dates << since unless since.to_date == today
+
+  dates.each do |date|
+    yield date, since
+
+    # workaround for daily data with durable New Relic recording system
+    unless since.to_date == today
+      since = today.to_time :utc
+    end
   end
-  processed_at = Time.now
-
-  component.options[:duration] = duration(since, processed_at)
-
-  processed_at
 end
 
-# Process data
+def submit_component_data(name)
+  date_key = Base64.encode64 "#{name}_previously_processed_at"
+  prev_processed_at = @cache.get date_key
 
-# get previous run time
-calls_prev_at = @cache.get('calls_previously_processed_at')
-sms_prev_at = @cache.get('sms_previously_processed_at')
+  processed_at = nil
+  daily_process_since(prev_processed_at) do |date, since|
+    collector = @new_relic.new_collector
+    component = collector.component name
 
-# since before yesterday midnight
-today = Time.now.strftime('%Y-%m-%d')
-before_yesterday = (Time.now - 2 * 24 * 3600).strftime('%Y-%m-%d')
+    data = []
+    yield data, date
 
-# calls
-calls_stats = {}
-TWILIO_CALL_STATUSES.each do |call_status|
-  opts = {:status => call_status}
-  if ['queued', 'in-progress'].include?(call_status)
-    # total for last two days for (still queued/in-progress)
-    opts[:"start_time>"] = before_yesterday
-  else
-    opts[:start_time] = today
+    data.each { |metric| component.add_metric(*metric) }
+    processed_at = Time.now.utc
+
+    component.options[:duration] = duration(since, processed_at)
+
+    collector.submit
+
+    processed_at
   end
 
-  calls_stats[call_status] = @twilio.account.calls.list(opts).total
+  @cache.put(date_key, processed_at.to_i)
 end
 
-calls_processed_at = add_component_data('Today Calls', 'calls', call_status, calls_prev_at)
+# Process statistics
 
-# SMS
-sms_stats = TWILIO_SMS_STATUSES.each_with_object({}) { |s, res| res[s] = 0 }
+# Today Calls
+submit_component_data('Today Calls by Status') do |stats, for_date|
+  opts = {:start_time => for_date}
+  TWILIO_CALL_STATUSES.each do |status|
+    opts[:status] = status
+    value = @twilio.account.calls.list(opts).total
+
+    stats << make_metric_record(status.capitalize, 'calls', value)
+  end
+end
+
+# Today SMSs
 # Twilio has no filter by status for SMS logs,
 # this could be very slow on huge SMS amount
-@twilio.account.sms.messages.list({:date_sent => today}) do |msg|
-  sms_stats[msg.status.to_s] += 1
+submit_component_data('Today SMSs by Status') do |stats, for_date|
+  collection = TWILIO_SMS_STATUSES.each_with_object({}) { |s, res| res[s] = 0 }
+  sms = @twilio.account.sms.messages.list({:date_sent => for_date})
+  # collect all stats for date first
+  begin
+    sms.each { |msg| collection[msg.status.to_s] += 1 }
+    sms = sms.next_page
+  end while not sms.empty?
+
+  collection.each_pair do |name, value|
+    stats << make_metric_record(name.capitalize, 'messages', value)
+  end
 end
 
-sms_processed_at = add_component_data('Today SMS', 'messages', sms_stats, sms_prev_at)
+# Today Usage
+submit_component_data('Today Usage') do |stats, for_date|
+  @twilio.account.usage.records.list({:start_date => for_date}).each do |record|
+    ['count', 'usage', 'price'].each do |submetric|
+      name = "#{record.category.capitalize} #{submetric.capitalize}"
+      unit = record.send "#{submetric}_unit"
+      value = record.send "#{submetric}"
 
-# send data to NewRelic
-@collector.submit
-
-# update cache timestamps
-@cache.put('calls_previously_processed_at', calls_processed_at)
-@cache.put('sms_previously_processed_at', sms_processed_at)
+      stats << make_metric_record(name, unit, value)
+    end
+  end
+end
