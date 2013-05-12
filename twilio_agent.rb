@@ -38,6 +38,7 @@ def duration(from, to)
 end
 
 def make_metric_record(name, unit, value)
+  puts "#{name} #{unit}: #{value}"
   [name, unit, value]
 end
 
@@ -47,14 +48,14 @@ def daily_process_since(previously_at)
 
   yesterday = today.yesterday.to_time :utc
   since = if previously_at
-            at = Time.at(prev).utc
+            at = Time.at(previously_at).utc
+            puts "Previously processed at: #{at}"
             # no earlier than yesterday
             (at < yesterday) ? yesterday : at
           else # first run
             today.to_time :utc
           end
-
-  dates << since unless since.to_date == today
+  dates << since.to_date unless since.to_date == today
 
   dates.each do |date|
     yield date, since
@@ -67,8 +68,10 @@ def daily_process_since(previously_at)
 end
 
 def submit_component_data(name)
+  puts "Processing: #{name}"
   date_key = Base64.encode64 "#{name}_previously_processed_at"
-  prev_processed_at = @cache.get date_key
+  date_cache_item = @cache.get date_key
+  prev_processed_at = date_cache_item ? date_cache_item.value : nil
 
   processed_at = nil
   daily_process_since(prev_processed_at) do |date, since|
@@ -82,12 +85,14 @@ def submit_component_data(name)
     processed_at = Time.now.utc
 
     component.options[:duration] = duration(since, processed_at)
+    puts "Duration is #{component.options[:duration]}"
 
     collector.submit
 
     processed_at
   end
 
+  puts "#{name} processed at #{processed_at}"
   @cache.put(date_key, processed_at.to_i)
 end
 
