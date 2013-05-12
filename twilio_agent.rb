@@ -32,14 +32,18 @@ ic = IronCache::Client.new(config['iron'])
 
 # Helpers
 
+# New Relic allows duration less than one hour
 def duration(from, to)
-  # do it Lisp-like (:
-  (from ? (to - from) : (to - to.beginning_of_day)).to_i
+  dur = from ? (to - from).to_i : 3600
+
+  dur > 3600 ? 3600 : dur
 end
 
 def make_metric_record(name, unit, value)
   puts "#{name} #{unit}: #{value}"
-  [name, unit, value]
+
+  enc_name = name.gsub(/[^a-zA-Z0-9]/, '_').downcase.camelize
+  (unit.blank? || value.blank?) ? [] : [enc_name, unit, value]
 end
 
 def daily_process_since(previously_at)
@@ -81,7 +85,9 @@ def submit_component_data(name)
     data = []
     yield data, date
 
-    data.each { |metric| component.add_metric(*metric) }
+    data.each do |metric|
+      component.add_metric(*metric) unless metric.empty?
+    end
     processed_at = Time.now.utc
 
     component.options[:duration] = duration(since, processed_at)
