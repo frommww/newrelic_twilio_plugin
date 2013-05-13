@@ -20,6 +20,7 @@ TWILIO_SMS_STATUSES = %w(queued sending sent failed received)
 # Configure Twilio client
 @twilio = Twilio::REST::Client.new(config['twilio']['account_sid'],
                                    config['twilio']['auth_token'])
+@tw_acc = @twilio.account
 
 # Configure NewRelic client
 @new_relic = NewRelic::Client.new(:license => config['newrelic']['license'],
@@ -117,10 +118,11 @@ end
 
 def collect_component_data(name, collector)
   puts "Processing: #{name}"
-  component = collector.component name
+  prefix = name.gsub(/[^a-zA-Z0-9]/, '_').downcase.camelize
+  component = collector.component 'Twilio'
 
   data = []
-  yield data
+  yield data, prefix
 
   data.each do |metric|
     component.add_metric(*metric) unless metric.empty?
@@ -132,22 +134,23 @@ end
 
 process_daily do |for_date, collector|
   # Today Calls
-  collect_component_data('Today/Calls', collector) do |stats|
+  collect_component_data('Today Calls', collector) do |stats, prefix|
     opts = {:start_time => for_date}
     TWILIO_CALL_STATUSES.each do |status|
       opts[:status] = status
-      value = @twilio.account.calls.list(opts).total
+      value = @tw_acc.calls.list(opts).total
+      name = "#{prefix}/#{status.capitalize}"
 
-      stats << make_metric_record(status.capitalize, 'calls', value)
+      stats << make_metric_record(name, 'calls', value)
     end
   end
 
   # Today SMSs
   # Twilio has no filter by status for SMS logs,
   # this could be very slow on huge SMS amount
-  collect_component_data('Today/SMS', collector) do |stats|
+  collect_component_data('Today SMS', collector) do |stats, prefix|
     collection = TWILIO_SMS_STATUSES.each_with_object({}) { |s, res| res[s] = 0 }
-    sms = @twilio.account.sms.messages.list({:date_sent => for_date})
+    sms = @tw_acc.sms.messages.list({:date_sent => for_date})
     # collect all stats for date first
     begin
       sms.each { |msg| collection[msg.status.to_s] += 1 }
@@ -155,15 +158,16 @@ process_daily do |for_date, collector|
     end while not sms.empty?
 
     collection.each_pair do |name, value|
-      stats << make_metric_record(name.capitalize, 'messages', value)
+      name = "#{prefix}/#{name.capitalize}"
+      stats << make_metric_record(name, 'messages', value)
     end
   end
 
   # Today Usage
-  collect_component_data('Today/Usage', collector) do |stats|
-    @twilio.account.usage.records.list({:start_date => for_date}).each do |record|
+  collect_component_data('Today Usage', collector) do |stats, prefix|
+    @tw_acc.usage.records.list({:start_date => for_date}).each do |record|
       ['count', 'usage', 'price'].each do |submetric|
-        name = "#{record.category.capitalize}/#{submetric.capitalize}"
+        name = "#{prefix}/#{record.category.capitalize}/#{submetric.capitalize}"
         unit = record.send "#{submetric}_unit"
         value = record.send "#{submetric}"
         value = submetric == 'price' ? value.to_f : value.to_i
