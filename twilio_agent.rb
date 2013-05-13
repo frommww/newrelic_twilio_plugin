@@ -39,18 +39,27 @@ def duration(from, to)
   dur > 3600 ? 3600 : dur
 end
 
-def make_metric_record(name, unit, value)
-  puts "#{name} #{unit}: #{value}"
+def daily_processed_at(processed = nil)
+  if processed
+    @cache.put('daily_previously_processed_at', processed.to_i)
 
-  enc_name = name.gsub(/[^a-zA-Z0-9]/, '_').downcase.camelize
-  (unit.blank? || value.blank?) ? [] : [enc_name, unit, value]
+    @at = processed
+  else
+    item = @cache.get 'daily_previously_processed_at'
+
+    @at ||= item ? item.value : nil
+  end
 end
 
-def daily_process_since(previously_at)
-  today = Time.now.utc.to_date
+def process_dates_since
+  now = Time.now.utc
+  today = now.to_date
+  yesterday = today.yesterday.to_time :utc
+
   dates = [today]
 
-  yesterday = today.yesterday.to_time :utc
+  # get from cache
+  previously_at = daily_processed_at
   since = if previously_at
             at = Time.at(previously_at).utc
             puts "Previously processed at: #{at}"
@@ -59,88 +68,108 @@ def daily_process_since(previously_at)
           else # first run
             today.to_time :utc
           end
-  dates << since.to_date unless since.to_date == today
 
+  since_d = since.to_date
+  # since yesterday and now < 12:59am, 3600 seconds max duration
+  if since_d != today && now.hour == 0 && now.minute < 59
+    dates << since_d
+  end
+
+  [dates, since]
+end
+
+def make_metric_record(name, unit, value)
+  puts "#{name} #{unit}: #{value}"
+
+  (unit.blank? || value.blank?) ? [] : [name, unit, value]
+end
+
+def process_daily
+  today = Time.now.utc.to_date
+  dates, since = process_dates_since
+
+  processed_at = nil
   dates.each do |date|
-    yield date, since
+    collector = @new_relic.new_collector
+
+    yield date, collector
+
+    processed_at = Time.now.utc
+    # update duration
+    current_duration = duration(since, processed_at)
+    collector.components.each_pair do |_, component|
+      component.options[:duration] = current_duration
+    end
+    # submit statistics
+    collector.submit
 
     # workaround for daily data with durable New Relic recording system
     unless since.to_date == today
       since = today.to_time :utc
+      # New Relic does not accept data more than twice a minute
+      sleep 30
     end
   end
+  puts "Processed at #{processed_at}"
+
+  daily_processed_at(processed_at.to_i)
 end
 
-def submit_component_data(name)
+def collect_component_data(name, collector)
   puts "Processing: #{name}"
-  date_key = Base64.encode64 "#{name}_previously_processed_at"
-  date_cache_item = @cache.get date_key
-  prev_processed_at = date_cache_item ? date_cache_item.value : nil
+  component = collector.component name
 
-  processed_at = nil
-  daily_process_since(prev_processed_at) do |date, since|
-    collector = @new_relic.new_collector
-    component = collector.component name
+  data = []
+  yield data
 
-    data = []
-    yield data, date
-
-    data.each do |metric|
-      component.add_metric(*metric) unless metric.empty?
-    end
-    processed_at = Time.now.utc
-
-    component.options[:duration] = duration(since, processed_at)
-    puts "Duration is #{component.options[:duration]}"
-
-    collector.submit
-
-    processed_at
+  data.each do |metric|
+    component.add_metric(*metric) unless metric.empty?
   end
-
-  puts "#{name} processed at #{processed_at}"
-  @cache.put(date_key, processed_at.to_i)
 end
+
 
 # Process statistics
 
-# Today Calls
-submit_component_data('Today Calls by Status') do |stats, for_date|
-  opts = {:start_time => for_date}
-  TWILIO_CALL_STATUSES.each do |status|
-    opts[:status] = status
-    value = @twilio.account.calls.list(opts).total
+process_daily do |for_date, collector|
+  # Today Calls
+  collect_component_data('Today/Calls', collector) do |stats|
+    opts = {:start_time => for_date}
+    TWILIO_CALL_STATUSES.each do |status|
+      opts[:status] = status
+      value = @twilio.account.calls.list(opts).total
 
-    stats << make_metric_record(status.capitalize, 'calls', value)
+      stats << make_metric_record(status.capitalize, 'calls', value)
+    end
   end
-end
 
-# Today SMSs
-# Twilio has no filter by status for SMS logs,
-# this could be very slow on huge SMS amount
-submit_component_data('Today SMSs by Status') do |stats, for_date|
-  collection = TWILIO_SMS_STATUSES.each_with_object({}) { |s, res| res[s] = 0 }
-  sms = @twilio.account.sms.messages.list({:date_sent => for_date})
-  # collect all stats for date first
-  begin
-    sms.each { |msg| collection[msg.status.to_s] += 1 }
-    sms = sms.next_page
-  end while not sms.empty?
+  # Today SMSs
+  # Twilio has no filter by status for SMS logs,
+  # this could be very slow on huge SMS amount
+  collect_component_data('Today/SMS', collector) do |stats|
+    collection = TWILIO_SMS_STATUSES.each_with_object({}) { |s, res| res[s] = 0 }
+    sms = @twilio.account.sms.messages.list({:date_sent => for_date})
+    # collect all stats for date first
+    begin
+      sms.each { |msg| collection[msg.status.to_s] += 1 }
+      sms = sms.next_page
+    end while not sms.empty?
 
-  collection.each_pair do |name, value|
-    stats << make_metric_record(name.capitalize, 'messages', value)
+    collection.each_pair do |name, value|
+      stats << make_metric_record(name.capitalize, 'messages', value)
+    end
   end
-end
 
-# Today Usage
-submit_component_data('Today Usage') do |stats, for_date|
-  @twilio.account.usage.records.list({:start_date => for_date}).each do |record|
-    ['count', 'usage', 'price'].each do |submetric|
-      name = "#{record.category.capitalize} #{submetric.capitalize}"
-      unit = record.send "#{submetric}_unit"
-      value = record.send "#{submetric}"
+  # Today Usage
+  collect_component_data('Today/Usage', collector) do |stats|
+    @twilio.account.usage.records.list({:start_date => for_date}).each do |record|
+      ['count', 'usage', 'price'].each do |submetric|
+        name = "#{record.category.capitalize}/#{submetric.capitalize}"
+        unit = record.send "#{submetric}_unit"
+        value = record.send "#{submetric}"
+        value = submetric == 'price' ? value.to_f : value.to_i
 
-      stats << make_metric_record(name, unit, value)
+        stats << make_metric_record(name, unit, value)
+      end
     end
   end
 end
