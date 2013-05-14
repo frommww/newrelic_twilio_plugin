@@ -72,7 +72,7 @@ def process_dates_since
 
   since_d = since.to_date
   # since yesterday and now < 12:59am, 3600 seconds max duration
-  if since_d != today && now.hour == 0 && now.minute < 59
+  if since_d != today && now.hour == 0 && now.min < 59
     dates << since_d
   end
 
