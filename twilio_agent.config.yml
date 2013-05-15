@@ -1,7 +1,7 @@
 newrelic:
   license: 'NEW_RELIC_LICENSE_KEY'
-  guid: ''
-  version: "1" # bump this everytime you upload a changed worker
+  guid: 'io.iron.twilio_agent'
+  version: '1' # bump this everytime you upload a changed worker
 
 iron:
   token: 'IRONIO_TOKEN'
