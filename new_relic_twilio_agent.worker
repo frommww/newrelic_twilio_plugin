@@ -1,5 +1,6 @@
 runtime 'ruby'
 exec 'twilio_agent.rb'
+name 'Twilio Agent (New Relic)'
 
 # uncomment when newrelic-platform gem will be public
 # gem_file 'Gemfile'
