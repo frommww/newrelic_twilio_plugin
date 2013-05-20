@@ -3,7 +3,7 @@ exec 'twilio_agent.rb'
 name 'Twilio Agent (New Relic)'
 
 # uncomment when newrelic-platform gem will be public
-# gem_file 'Gemfile'
+# gemfile 'Gemfile'
 
 gem 'twilio-ruby'
 gem 'iron_cache'
