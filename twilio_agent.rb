@@ -28,10 +28,21 @@ TWILIO_SMS_STATUSES = %w(queued sending sent failed received)
                                   :version => config['newrelic']['version'])
 
 # Configure IronCache client
-ic = IronCache::Client.new(config['iron'])
-@cache = ic.cache("newrelic-twilio-agent")
+begin
+  @cache = IronCache::Client.new(config['iron']).cache("newrelic-twilio-agent")
+rescue Exception => err
+  abort 'Iron.io credentials are wrong'
+end
 
 # Helpers
+def stderr_to_stdout
+  $stderr_backup = $stderr unless $stderr_backup
+  $stderr = $stdout
+end
+
+def restore_stderr
+  $stderr = $stderr_backup if $stderr_backup
+end
 
 # New Relic allows duration less than one hour
 def duration(from, to)
@@ -46,7 +57,12 @@ def daily_processed_at(processed = nil)
 
     @at = processed
   else
-    item = @cache.get 'daily_previously_processed_at'
+    item = begin
+             @cache.get 'daily_previously_processed_at'
+           rescue Exception => err
+             restore_stderr
+             abort 'Seems Iron.io Token is wrong.'
+           end
 
     @at ||= item ? item.value : nil
   end
@@ -101,8 +117,19 @@ def process_daily
     collector.components.each_pair do |_, component|
       component.options[:duration] = current_duration
     end
-    # submit statistics
-    collector.submit
+
+    begin
+      # submit statistics
+      collector.submit
+    rescue Exception => err
+      restore_stderr
+      if err.message.downcase =~ /http 403/
+        abort "Seems New Relic's license key is wrong."
+      else
+        abort("Error happened while sending data to New Relic. " +
+              "Error message: '#{err.message}'.")
+      end
+    end
 
     # workaround for daily data with durable New Relic recording system
     unless since.to_date == today
@@ -131,49 +158,59 @@ end
 
 
 # Process statistics
-
+stderr_to_stdout
 process_daily do |for_date, collector|
-  # Today Calls
-  collect_component_data('Today Calls', collector) do |stats, prefix|
-    opts = {:start_time => for_date}
-    TWILIO_CALL_STATUSES.each do |status|
-      opts[:status] = status
-      value = @tw_acc.calls.list(opts).total
-      name = "#{prefix}/#{status.capitalize}"
+  begin
+    # Today Calls
+    collect_component_data('Today Calls', collector) do |stats, prefix|
+      opts = {:start_time => for_date}
+      TWILIO_CALL_STATUSES.each do |status|
+        opts[:status] = status
+        value = @tw_acc.calls.list(opts).total
+        name = "#{prefix}/#{status.capitalize}"
 
-      stats << make_metric_record(name, 'calls', value)
-    end
-  end
-
-  # Today SMSs
-  # Twilio has no filter by status for SMS logs,
-  # this could be very slow on huge SMS amount
-  collect_component_data('Today SMS', collector) do |stats, prefix|
-    collection = TWILIO_SMS_STATUSES.each_with_object({}) { |s, res| res[s] = 0 }
-    sms = @tw_acc.sms.messages.list({:date_sent => for_date})
-    # collect all stats for date first
-    begin
-      sms.each { |msg| collection[msg.status.to_s] += 1 }
-      sms = sms.next_page
-    end while not sms.empty?
-
-    collection.each_pair do |name, value|
-      name = "#{prefix}/#{name.capitalize}"
-      stats << make_metric_record(name, 'messages', value)
-    end
-  end
-
-  # Today Usage
-  collect_component_data('Today Usage', collector) do |stats, prefix|
-    @tw_acc.usage.records.list({:start_date => for_date}).each do |record|
-      ['count', 'usage', 'price'].each do |submetric|
-        name = "#{prefix}/#{record.category.capitalize}/#{submetric.capitalize}"
-        unit = record.send "#{submetric}_unit"
-        value = record.send "#{submetric}"
-        value = submetric == 'price' ? value.to_f : value.to_i
-
-        stats << make_metric_record(name, unit, value)
+        stats << make_metric_record(name, 'calls', value)
       end
+    end
+
+    # Today SMSs
+    # Twilio has no filter by status for SMS logs,
+    # this could be very slow on huge SMS amount
+    collect_component_data('Today SMS', collector) do |stats, prefix|
+      collection = TWILIO_SMS_STATUSES.each_with_object({}) { |s, res| res[s] = 0 }
+      sms = @tw_acc.sms.messages.list({:date_sent => for_date})
+      # collect all stats for date first
+      begin
+        sms.each { |msg| collection[msg.status.to_s] += 1 }
+        sms = sms.next_page
+      end while not sms.empty?
+
+      collection.each_pair do |name, value|
+        name = "#{prefix}/#{name.capitalize}"
+        stats << make_metric_record(name, 'messages', value)
+      end
+    end
+
+    # Today Usage
+    collect_component_data('Today Usage', collector) do |stats, prefix|
+      @tw_acc.usage.records.list({:start_date => for_date}).each do |record|
+        ['count', 'usage', 'price'].each do |submetric|
+          name = "#{prefix}/#{record.category.capitalize}/#{submetric.capitalize}"
+          unit = record.send "#{submetric}_unit"
+          value = record.send "#{submetric}"
+          value = submetric == 'price' ? value.to_f : value.to_i
+
+          stats << make_metric_record(name, unit, value)
+        end
+      end
+    end
+  rescue Exception => err
+    restore_stderr
+    if err.message.downcase =~ /authenticate/
+      abort 'Twilio account SID / token pair is wrong.'
+    else
+      abort("Error happened while retrieving data from Twilio." +
+            "Error message: '#{err.message}'.")
     end
   end
 end
